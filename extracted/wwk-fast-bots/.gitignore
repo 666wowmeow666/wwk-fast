@@ -1,0 +1,14 @@
+.env
+.env.*
+!.env.example
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.sqlite3
+*.db
+.idea/
+.vscode/
+dist/
+*.egg-info/
+/data/
