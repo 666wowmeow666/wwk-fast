@@ -1,0 +1,37 @@
+name: Unpack ZIP
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/main.yml"
+      - "WWK_FAST_BOTS_AMVERA_READY-1.zip"
+
+permissions:
+  contents: write
+
+jobs:
+  unpack:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download repository
+        uses: actions/checkout@v4
+
+      - name: Extract archive
+        run: |
+          unzip -o "WWK_FAST_BOTS_AMVERA_READY-1.zip" -d extracted
+
+      - name: Save extracted files
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add -- extracted/
+
+          if git diff --cached --quiet; then
+            echo "No new changes"
+          else
+            git commit -m "Extract ZIP archive"
+            git push
+          fi
