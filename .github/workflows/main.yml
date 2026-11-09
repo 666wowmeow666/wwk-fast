@@ -1,2 +1,0 @@
-- name: Unzip archive
-  run: unzip -o WWK_FAST_BOTS_AMVERA_READY-1.zip -d extracted
