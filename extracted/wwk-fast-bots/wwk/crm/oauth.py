@@ -112,6 +112,11 @@ class OAuthTokenProvider:
             response = await self._transport.post_json(self._url, payload, self._timeout)
 
         if not 200 <= response.status < 300:
+            # Записываем только статус и тип grant. Тело ответа может содержать
+            # чувствительные сведения, поэтому его никогда не логируем.
+            grant_type = "refresh_token" if use_refresh else "password"
+            log.warning("4logist OAuth token endpoint returned HTTP %s (grant_type=%s)",
+                        response.status, grant_type)
             if response.status in (400, 401, 403):
                 raise CrmAuthError(f"4logist OAuth: HTTP {response.status}; проверьте OAuth-реквизиты и доступ")
             raise CrmUnavailable(f"4logist OAuth: HTTP {response.status}")
