@@ -168,7 +168,9 @@ def build_team_router(employees: EmployeeService, client_auth: ClientAuthService
                 try:
                     shape = json.dumps(describe_shape(await crm.probe(key)), ensure_ascii=False, indent=1)
                 except CrmError as e:
-                    shape = f"ошибка: {type(e).__name__}"
+                    # CRM-ошибки содержат только безопасную диагностику (этап/метод/HTTP-код),
+                    # но не включают тела ответов, заголовки, токены или OAuth-секреты.
+                    shape = f"ошибка: {type(e).__name__}: {str(e)}"
                 await message.answer(clip(f"<b>{key}</b>\n<pre>{esc(shape[:1500])}</pre>"))
 
     @router.message(Command("audit"))
