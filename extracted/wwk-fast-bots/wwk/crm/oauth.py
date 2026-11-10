@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time
 from dataclasses import dataclass
 from typing import Any, Mapping, Protocol
@@ -36,12 +37,21 @@ class HttpxOAuthTransport:
 
     async def post_json(self, url: str, payload: Mapping[str, str], timeout: float) -> OAuthHttpResponse:
         try:
-            response = await self._client.post(url, json=dict(payload), timeout=timeout,
-                                               headers={"Content-Type": "application/json", "Accept": "application/json"})
+            response = await self._client.post(
+                url,
+                json=dict(payload),
+                timeout=timeout,
+                headers={
+                    "Content-Type": "application/json",
+                    "Accept": "application/json",
+                },
+            )
         except self._httpx.TimeoutException:
             raise CrmUnavailable("4logist OAuth: превышено время ожидания") from None
         except self._httpx.HTTPError as exc:
-            raise CrmUnavailable(f"4logist OAuth: ошибка соединения ({type(exc).__name__})") from None
+            raise CrmUnavailable(
+                f"4logist OAuth: ошибка соединения ({type(exc).__name__})"
+            ) from None
         return OAuthHttpResponse(response.status_code, response.content)
 
     async def aclose(self) -> None:
@@ -51,12 +61,24 @@ class HttpxOAuthTransport:
 class OAuthTokenProvider:
     """Получает access_token по password grant и обновляет его по refresh_token."""
 
-    def __init__(self, base_url: str, client_id: str, client_secret: str, username: str, password: str,
-                 *, transport: OAuthTransport | None = None, timeout: float = 15.0,
-                 safety_margin_seconds: int = 30) -> None:
+    def __init__(
+        self,
+        base_url: str,
+        client_id: str,
+        client_secret: str,
+        username: str,
+        password: str,
+        *,
+        transport: OAuthTransport | None = None,
+        timeout: float = 15.0,
+        safety_margin_seconds: int = 30,
+    ) -> None:
         required = (base_url, client_id, client_secret, username, password)
         if not all(str(v).strip() for v in required):
-            raise ValueError("Для OAuth 4logist нужны base_url, client_id, client_secret, username и password")
+            raise ValueError(
+                "Для OAuth 4logist нужны base_url, client_id, client_secret, username и password"
+            )
+
         self._url = base_url.rstrip("/") + "/oauth/v2/token"
         self._client_id = client_id
         self._client_secret = client_secret
@@ -75,73 +97,166 @@ class OAuthTokenProvider:
         return "OAuthTokenProvider(token=***)"
 
     def _valid(self) -> bool:
-        return bool(self._access_token and time.monotonic() < self._expires_at - self._margin)
+        return bool(
+            self._access_token
+            and time.monotonic() < self._expires_at - self._margin
+        )
 
     async def access_token(self) -> str:
         if self._valid():
             return self._access_token
+
         async with self._lock:
             if self._valid():
                 return self._access_token
+
             await self._obtain(use_refresh=bool(self._refresh_token))
             return self._access_token
 
     async def refresh_after_unauthorized(self, used_token: str) -> str:
         """Refresh once after 401; concurrent requests reuse the newly issued token."""
         async with self._lock:
-            if self._access_token and self._access_token != used_token and self._valid():
+            if (
+                self._access_token
+                and self._access_token != used_token
+                and self._valid()
+            ):
                 return self._access_token
+
             await self._obtain(use_refresh=bool(self._refresh_token))
             return self._access_token
 
+    @staticmethod
+    def _safe_error_code(body: bytes) -> str | None:
+        """Return only a short OAuth error identifier; never expose raw response text."""
+        try:
+            parsed = json.loads(body.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return None
+
+        if not isinstance(parsed, dict):
+            return None
+
+        value = parsed.get("error")
+        if not isinstance(value, str):
+            return None
+
+        value = value.strip()
+
+        # OAuth error tokens are short identifiers. Reject everything else.
+        if not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", value):
+            return None
+
+        return value
+
     async def _obtain(self, *, use_refresh: bool) -> None:
         if use_refresh:
-            payload = {"grant_type": "refresh_token", "client_id": self._client_id,
-                       "client_secret": self._client_secret, "refresh_token": self._refresh_token}
-            response = await self._transport.post_json(self._url, payload, self._timeout)
+            payload = {
+                "grant_type": "refresh_token",
+                "client_id": self._client_id,
+                "client_secret": self._client_secret,
+                "refresh_token": self._refresh_token,
+            }
+
+            response = await self._transport.post_json(
+                self._url,
+                payload,
+                self._timeout,
+            )
+
             # If the refresh token was revoked/expired, fall back to the supplied
             # resource-owner credentials. Any other failure is surfaced.
             if response.status in (400, 401):
-                log.warning("4logist OAuth refresh rejected; trying password grant")
+                log.warning(
+                    "4logist OAuth refresh rejected; trying password grant"
+                )
                 await self._obtain(use_refresh=False)
                 return
+
         else:
-            payload = {"grant_type": "password", "client_id": self._client_id,
-                       "client_secret": self._client_secret, "username": self._username,
-                       "password": self._password}
-            response = await self._transport.post_json(self._url, payload, self._timeout)
+            payload = {
+                "grant_type": "password",
+                "client_id": self._client_id,
+                "client_secret": self._client_secret,
+                "username": self._username,
+                "password": self._password,
+            }
+
+            response = await self._transport.post_json(
+                self._url,
+                payload,
+                self._timeout,
+            )
 
         if not 200 <= response.status < 300:
-            # Записываем только статус и тип grant. Тело ответа может содержать
-            # чувствительные сведения, поэтому его никогда не логируем.
+            # Извлекаем только стандартизированный OAuth error code.
+            # Не выводим response body / error_description.
             grant_type = "refresh_token" if use_refresh else "password"
-            log.warning("4logist OAuth token endpoint returned HTTP %s (grant_type=%s)",
-                        response.status, grant_type)
+            error_code = self._safe_error_code(response.body)
+
+            log.warning(
+                "4logist OAuth token endpoint returned HTTP %s "
+                "(grant_type=%s, oauth_error=%s)",
+                response.status,
+                grant_type,
+                error_code or "not_provided",
+            )
+
+            details = f"; oauth_error={error_code}" if error_code else ""
+
             if response.status in (400, 401, 403):
-                raise CrmAuthError(f"4logist OAuth: HTTP {response.status}; проверьте OAuth-реквизиты и доступ")
-            raise CrmUnavailable(f"4logist OAuth: HTTP {response.status}")
+                raise CrmAuthError(
+                    f"4logist OAuth: HTTP {response.status}{details}; "
+                    f"grant_type={grant_type}. Смотри код ошибки в ответе OAuth"
+                )
+
+            raise CrmUnavailable(
+                f"4logist OAuth: HTTP {response.status}{details}"
+            )
+
         try:
             body: Any = json.loads(response.body.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError):
-            raise CrmAuthError("4logist OAuth: ответ не является корректным JSON") from None
+            raise CrmAuthError(
+                "4logist OAuth: ответ не является корректным JSON"
+            ) from None
+
         if not isinstance(body, dict):
             raise CrmAuthError("4logist OAuth: неожиданный формат ответа")
+
         access = body.get("access_token")
         refresh = body.get("refresh_token")
         token_type = body.get("token_type") or "Bearer"
+
         try:
             expires_in = int(body.get("expires_in"))
         except (TypeError, ValueError):
             expires_in = 0
-        if not isinstance(access, str) or not access or not isinstance(refresh, str) or not refresh or expires_in <= 0:
-            raise CrmAuthError("4logist OAuth: в ответе отсутствуют access_token / refresh_token / expires_in")
+
+        if (
+            not isinstance(access, str)
+            or not access
+            or not isinstance(refresh, str)
+            or not refresh
+            or expires_in <= 0
+        ):
+            raise CrmAuthError(
+                "4logist OAuth: в ответе отсутствуют "
+                "access_token / refresh_token / expires_in"
+            )
+
         if not isinstance(token_type, str) or not token_type.strip():
             token_type = "Bearer"
+
         self._access_token = access
         self._refresh_token = refresh
         self._token_type = token_type.strip()
         self._expires_at = time.monotonic() + expires_in
-        log.info("4logist OAuth: токен получен/обновлён, срок действия %s сек.", expires_in)
+
+        log.info(
+            "4logist OAuth: токен получен/обновлён, срок действия %s сек.",
+            expires_in,
+        )
 
     def authorization_header(self, access_token: str | None = None) -> str:
         token = access_token or self._access_token
